@@ -1,0 +1,350 @@
+substitutions:
+  devicename: boilerplate-va
+  friendly_name: Boilerplate VA
+  api_encryption_key: !secret bp-va-api-encryption-key
+  ota_password: !secret bp-va-ota-password
+
+  # Pinmap
+  i2s_in_bclk_pin: GPIO16
+  i2s_in_lrclk_pin: GPIO17
+  i2s_out_bclk_pin: GPIO40
+  i2s_out_lrclk_pin: GPIO42
+  i2s_mic_din_pin: GPIO21
+  i2s_dac_dout_pin: GPIO41
+  led_data_pin: GPIO48
+
+globals:
+  - id: wakeword_enabled
+    type: bool
+    restore_value: false
+    initial_value: "true"
+
+esphome:
+  name: ${devicename}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - globals.set:
+          id: wakeword_enabled
+          value: "true"
+      - micro_wake_word.start:
+
+esp32:
+  variant: esp32s3
+  cpu_frequency: 240MHz
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: debug
+  initial_level: debug
+  logs:
+    sensor: WARN
+
+api:
+  encryption:
+    key: ${api_encryption_key}
+
+ota:
+  - platform: esphome
+    id: ota_esphome
+    password: ${ota_password}
+
+wifi:
+  networks:
+  - ssid: !secret wifi_ssid
+    password: !secret wifi_password
+  # manual_ip:
+  #   static_ip: 192.168.2.53
+  #   gateway: 192.168.2.1
+  #   subnet: 255.255.255.0
+
+captive_portal:
+improv_serial:
+
+i2s_audio:
+  - id: i2s_in_bus
+    i2s_bclk_pin: ${i2s_in_bclk_pin}
+    i2s_lrclk_pin: ${i2s_in_lrclk_pin}
+  - id: i2s_out_bus
+    i2s_bclk_pin: ${i2s_out_bclk_pin}
+    i2s_lrclk_pin: ${i2s_out_lrclk_pin}
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: onboard_led
+    name: "${friendly_name} Status LED"
+    pin: ${led_data_pin}
+    num_leds: 1
+    chipset: WS2812
+    rgb_order: GRB
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 0s
+    effects:
+      - pulse:
+          name: "Slow Pulse"
+          id: slow_pulse
+          transition_length: 250ms
+          update_interval: 250ms
+      - pulse:
+          id: fast_pulse
+          name: "Fast Pulse"
+          transition_length: 100ms
+          update_interval: 100ms
+
+script:
+  - id: led_idle
+    then:
+      - light.turn_off: onboard_led
+
+  - id: led_listening
+    then:
+      - light.turn_on:
+          id: onboard_led
+          red: 100%
+          green: 0%
+          blue: 100%
+          brightness: 100%
+          effect: "Slow Pulse"
+
+  - id: led_processing
+    then:
+      - light.turn_on:
+          id: onboard_led
+          red: 100%
+          green: 0%
+          blue: 100%
+          brightness: 100%
+          effect: "Fast Pulse"
+
+  - id: led_answering
+    then:
+      - light.turn_on:
+          id: onboard_led
+          red: 0%
+          green: 0%
+          blue: 100%
+          brightness: 100%
+          effect: "Slow Pulse"
+
+microphone:
+  - platform: i2s_audio
+    id: va_mic
+    i2s_audio_id: i2s_in_bus
+    adc_type: external
+    i2s_din_pin: ${i2s_mic_din_pin}
+    pdm: false
+    channel: left
+    sample_rate: 16000
+    bits_per_sample: 32bit
+    use_apll: true
+    correct_dc_offset: true
+
+speaker:
+  - platform: i2s_audio
+    id: va_speaker
+    i2s_audio_id: i2s_out_bus
+    dac_type: external
+    i2s_dout_pin: ${i2s_dac_dout_pin}
+    channel: mono
+    sample_rate: 48000
+    bits_per_sample: 16bit
+    use_apll: true
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: va_speaker
+    num_channels: 1
+    source_speakers:
+      - id: announcement_mixing_input
+        timeout: never
+      - id: media_mixing_input
+        timeout: never
+  - platform: resampler
+    id: announcement_resampling_speaker
+    output_speaker: announcement_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+  - platform: resampler
+    id: media_resampling_speaker
+    output_speaker: media_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+
+sendspin:
+  id: sendspin_hub
+  task_stack_in_psram: true
+
+media_player:
+  - platform: speaker_source
+    id: external_media_player
+    name: "${friendly_name} Media"
+    internal: false
+    media_pipeline:
+      speaker: media_resampling_speaker
+      num_channels: 1
+      sample_rate: 48000
+      sources:
+        - sendspin_source
+        - http_source_media
+        - file_source_media
+    announcement_pipeline:
+      speaker: announcement_resampling_speaker
+      format: FLAC
+      num_channels: 1
+      sample_rate: 48000
+      sources:
+        - http_source_announcement
+        - file_source_announcement
+    on_announcement:
+      - mixer_speaker.apply_ducking:
+          id: media_mixing_input
+          decibel_reduction: 20
+          duration: 0.0s
+    on_state:
+      if:
+        condition:
+          and:
+            - not:
+                voice_assistant.is_running:
+            - not:
+                media_player.is_announcing:
+        then:
+          - mixer_speaker.apply_ducking:
+              id: media_mixing_input
+              decibel_reduction: 0
+              duration: 1.0s
+    on_idle:
+      - logger.log: "Media player finished playing"
+      - script.execute: led_idle
+
+media_source:
+  - platform: audio_file
+    id: file_source_media
+    task_stack_in_psram: true
+  - platform: audio_file
+    id: file_source_announcement
+    task_stack_in_psram: true
+  - platform: audio_http
+    id: http_source_media
+    task_stack_in_psram: true
+  - platform: audio_http
+    id: http_source_announcement
+    task_stack_in_psram: true
+  - platform: sendspin
+    id: sendspin_source
+    task_stack_in_psram: true
+
+audio_file:
+  - id: wake_word_triggered_sound
+    file: https://github.com/rgnyldz/r2d2/raw/refs/heads/main/r2d2-wake.mp3 # change as you like :)
+
+micro_wake_word:
+  id: mww
+  microphone:
+    microphone: va_mic
+    channels: 0
+    gain_factor: 4
+  models:
+    - id: okay_nabu_model
+      model: okay_nabu
+  vad:
+  stop_after_detection: true
+  task_stack_in_psram: true
+  on_wake_word_detected:
+    then:
+      - media_player.play_media:
+          id: external_media_player
+          media_url: audio-file://wake_word_triggered_sound
+          announcement: true
+      - delay: 1000ms # change according to your wake sound so it doesnt get picked up while listening.
+      - voice_assistant.start:
+
+voice_assistant:
+  micro_wake_word: mww
+  microphone:
+    microphone: va_mic
+    channels: 0
+    gain_factor: 4
+  media_player: external_media_player
+  use_wake_word: false
+  noise_suppression_level: 2
+  auto_gain: 31dBFS
+  volume_multiplier: 2.0
+  on_start:
+    - logger.log: "Voice assistant pipeline start requested"
+    - mixer_speaker.apply_ducking:
+        id: media_mixing_input
+        decibel_reduction: 20
+        duration: 0.0s
+  on_listening:
+    - logger.log: "Voice assistant pipeline listening requested"
+    - script.execute: led_listening
+  on_stt_end:
+    - logger.log: "Voice assistant pipeline STT end requested"
+    - script.execute: led_processing
+    - logger.log:
+        format: "STT text: %s"
+        args: ["x.c_str()"]
+  on_intent_start:
+    - logger.log: "Voice assistant pipeline intent start requested"
+    - script.execute: led_processing
+  on_tts_start:
+    - logger.log: "Voice assistant pipeline TTS start requested"
+    - script.execute: led_answering
+  on_tts_end:
+    - logger.log: "Voice assistant pipeline TTS end requested"
+  on_idle:
+    - logger.log: "Voice assistant pipeline idle requested"
+    - script.execute: led_idle
+  on_error:
+    - logger.log: "Voice assistant pipeline error requested"
+    - lambda: |-
+        ESP_LOGE("voice_assistant", "Error code=%d message=%s", code, message.c_str());
+    - script.execute: led_idle
+  on_end:
+    - logger.log: "Voice assistant pipeline end requested"
+    - if:
+        condition:
+          lambda: return id(wakeword_enabled);
+        then:
+          - micro_wake_word.start:
+  on_client_connected:
+    - logger.log: "Voice assistant pipeline client connected requested"
+    - if:
+        condition:
+          lambda: return id(wakeword_enabled);
+        then:
+          - micro_wake_word.start:
+    - script.execute: led_idle
+  on_client_disconnected:
+    - logger.log: "Voice assistant pipeline client disconnected requested"
+    - micro_wake_word.stop:
+    - script.execute: led_idle
+
+switch:
+  - platform: template
+    id: wake_word_enabled
+    name: "${friendly_name} Wake Word"
+    lambda: |-
+      return id(wakeword_enabled);
+    turn_on_action:
+      - globals.set:
+          id: wakeword_enabled
+          value: "true"
+      - micro_wake_word.start:
+    turn_off_action:
+      - globals.set:
+          id: wakeword_enabled
+          value: "false"
+      - micro_wake_word.stop:
+      - if:
+          condition:
+            voice_assistant.is_running:
+          then:
+            - voice_assistant.stop:
