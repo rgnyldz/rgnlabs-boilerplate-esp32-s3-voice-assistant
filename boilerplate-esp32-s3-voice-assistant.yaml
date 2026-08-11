@@ -262,7 +262,7 @@ micro_wake_word:
           id: external_media_player
           media_url: audio-file://wake_word_triggered_sound
           announcement: true
-      - delay: 1000ms # change according to your wake sound so it doesnt get picked up while listening.
+      - delay: 1000ms # change according to your wake sound so it doesn't get picked up while VA start's listening.
       - voice_assistant.start:
 
 voice_assistant:
